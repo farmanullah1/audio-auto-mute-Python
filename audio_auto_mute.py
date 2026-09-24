@@ -44,13 +44,13 @@ from pycaw.pycaw import AudioUtilities, IMMDeviceEnumerator, AudioDeviceState
 # Can be a single string (e.g., "RONiN ECLIPSE") or a list of names for multiple headsets.
 # Matching is case-insensitive. Set to None for automatic earphone detection.
 # Examples: "RONiN ECLIPSE", ["RONiN ECLIPSE", "Sony WH-1000XM4", "AirPods Pro"]
-EARPHONE_DEVICE_NAME: Optional[Union[str, List[str]]] = None
+EARPHONE_DEVICE_NAME: Optional[Union[str, List[str]]] = "RONiN ECLIPSE"
 
 # Optional: Exact Windows Core Audio Endpoint ID for your earphones.
 # If provided, this ID takes precedence over EARPHONE_DEVICE_NAME.
 # Run `python audio_auto_mute.py --list-devices` to view all device IDs.
 # Example: "{0.0.0.00000000}.{73504252-5a55-4e32-8eb1-1a96cc0659e2}"
-EARPHONE_DEVICE_ID: Optional[str] = None
+EARPHONE_DEVICE_ID: Optional[str] = "{0.0.0.00000000}.{73504252-5a55-4e32-8eb1-1a96cc0659e2}"
 
 # When earphones disconnect and Windows switches default output to speakers:
 # True  = Mute ONLY the newly selected default playback device (Recommended).
