@@ -633,6 +633,16 @@ class AudioAutoMuteMonitor(MMNotificationClient):
         # CASE 1: EARPHONES DISCONNECTED (Scenario A)
         # ----------------------------------------------------------------------
         if self.was_earphone_active_or_default and not earphone_active:
+            # If earphones disconnected but Windows hasn't finished switching the default endpoint yet,
+            # wait up to 100ms (5 x 20ms) to catch the new default output immediately.
+            if cur_def_id == self.tracked_earphone_id:
+                for _ in range(5):
+                    time.sleep(0.02)
+                    new_id, new_name = get_default_render_device(self.enumerator)
+                    if new_id and new_id != self.tracked_earphone_id:
+                        cur_def_id, cur_def_name = new_id, new_name
+                        break
+
             if cur_def_id != self.tracked_earphone_id:
                 self.logger.warning(
                     "--> Wireless earphones disconnected! Windows switched default output to: '%s'",
@@ -741,6 +751,8 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                         self.logger.info("Successfully re-registered audio event notifications after system wake.")
                     except Exception as re_err:
                         self.logger.debug("Re-registration note: %s", re_err)
+            except Exception as e:
+                self.logger.debug("Heartbeat sync note: %s", e)
 
 # ==============================================================================
 # MAIN APPLICATION CONTROLLER
@@ -838,6 +850,11 @@ def main():
         def win_console_ctrl_handler(ctrl_type):
             logger.info("Windows console event received (code=%d). Initiating clean shutdown...", ctrl_type)
             shutdown_event.set()
+            try:
+                monitor.unregister_callbacks()
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
             return True
         _console_ctrl_handler = HandlerRoutine(win_console_ctrl_handler)
         ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_ctrl_handler, True)
