@@ -724,7 +724,7 @@ class AudioAutoMuteMonitor(MMNotificationClient):
     def heartbeat_check(self):
         """
         Periodic fail-safe check run in the main thread loop.
-        Re-acquires COM enumerator if invalid (e.g. after laptop resumes from sleep).
+        Re-acquires COM enumerator and re-registers callbacks if invalid (e.g. after laptop sleep).
         """
         with self._lock:
             try:
@@ -736,8 +736,11 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                     self.logger.warning("Re-acquiring Windows Audio COM enumerator after system wake/disconnect...")
                     try:
                         self.enumerator = AudioUtilities.GetDeviceEnumerator()
-                    except Exception:
-                        pass
+                        self.enumerator.RegisterEndpointNotificationCallback(self)
+                        self._is_registered = True
+                        self.logger.info("Successfully re-registered audio event notifications after system wake.")
+                    except Exception as re_err:
+                        self.logger.debug("Re-registration note: %s", re_err)
 
 # ==============================================================================
 # MAIN APPLICATION CONTROLLER
@@ -827,6 +830,19 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Register Win32 console handler for clean exit when terminal window [X] is clicked
+    try:
+        from ctypes import wintypes
+        HandlerRoutine = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+        def win_console_ctrl_handler(ctrl_type):
+            logger.info("Windows console event received (code=%d). Initiating clean shutdown...", ctrl_type)
+            shutdown_event.set()
+            return True
+        _console_ctrl_handler = HandlerRoutine(win_console_ctrl_handler)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_ctrl_handler, True)
+    except Exception as e:
+        logger.debug("Console handler note: %s", e)
 
     logger.info("Audio Auto-Mute Guardian is running. Waiting for events...")
 

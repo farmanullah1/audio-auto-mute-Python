@@ -104,7 +104,7 @@ Run the guardian in your terminal when you begin working:
 ```powershell
 python audio_auto_mute.py
 ```
-*(or `py audio_auto_mute.py`)*
+*(or simply double-click `run.bat`)*
 
 ### 4. Stop Protection
 Press **`Ctrl+C`** at any time. The script unregisters all callbacks, cleans up COM handles, and terminates immediately.
