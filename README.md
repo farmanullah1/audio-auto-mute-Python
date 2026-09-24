@@ -1,5 +1,10 @@
 # Windows Audio Auto-Mute Guardian (Python)
 
+[![Windows Audio Tests](https://github.com/farmanullah1/audio-auto-mute-Python/actions/workflows/test.yml/badge.svg)](https://github.com/farmanullah1/audio-auto-mute-Python/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
+[![Platform: Windows 10 / 11](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-0078D6.svg)](https://www.microsoft.com/windows)
+
 A lightweight, safe, user-controlled Python 3 tool for Windows 10 & 11 that monitors audio playback device transitions and **automatically mutes laptop speakers when your wireless/Bluetooth earphones disconnect**.
 
 Designed specifically for office workers and open-plan environments to prevent sudden, embarrassing audio blaring when earphones run out of battery or drop Bluetooth connection.
@@ -100,14 +105,16 @@ python audio_auto_mute.py --list-devices
 ```
 
 ### 3. Start Protection
-Run the guardian in your terminal when you begin working:
-```powershell
-python audio_auto_mute.py
-```
-*(or simply double-click `run.bat`)*
+You can start protection in any of these ways:
+* **1-Click Desktop Icon**: Double-click the **Audio Guardian** shortcut on your Windows Desktop.
+* **Batch Launcher**: Double-click [`run.bat`](run.bat).
+* **Terminal**: Run in PowerShell or Command Prompt:
+  ```powershell
+  python audio_auto_mute.py
+  ```
 
 ### 4. Stop Protection
-Press **`Ctrl+C`** at any time. The script unregisters all callbacks, cleans up COM handles, and terminates immediately.
+Press **`Ctrl+C`** (or close the terminal window) at any time. The script unregisters all callbacks, cleans up COM handles, and terminates immediately.
 
 ---
 
