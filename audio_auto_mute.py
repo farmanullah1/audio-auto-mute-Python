@@ -24,6 +24,7 @@ if not hasattr(sys, "coinit_flags"):
 
 import argparse
 import ctypes
+from dataclasses import dataclass
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -81,6 +82,23 @@ PAUSE_MEDIA_ON_DISCONNECT: bool = False
 # (< 20ms); this interval provides a lightweight fail-safe sync and ensures
 # instant responsiveness to Ctrl+C interrupt signals.
 POLL_INTERVAL: float = 1.0
+
+# ==============================================================================
+# BATTERY MONITORING CONFIGURATION
+# ==============================================================================
+
+# Enable or disable background battery monitoring for connected earphones.
+# Default: True.
+BATTERY_MONITORING_ENABLED: bool = True
+
+# Battery status query interval in seconds.
+# Default: 30.0 seconds (lightweight, minimal CPU/memory impact).
+BATTERY_CHECK_INTERVAL: float = 30.0
+
+# Low battery warning configuration.
+# When True, logs a warning if earphone or case battery falls to or below threshold.
+LOW_BATTERY_WARNING_ENABLED: bool = True
+LOW_BATTERY_THRESHOLD: int = 20  # Percentage (e.g. 20%)
 
 # Logging level: "DEBUG", "INFO", "WARNING", "ERROR"
 LOG_LEVEL: str = "INFO"
@@ -318,6 +336,232 @@ def restore_endpoint(
         return False
 
 # ==============================================================================
+# WINDOWS BLUETOOTH BATTERY MONITORING (cfgmgr32.dll)
+# ==============================================================================
+
+class DEVPROPKEY(ctypes.Structure):
+    """Windows Configuration Manager Device Property Key structure."""
+    _fields_ = [
+        ("fmtid_data1", ctypes.c_ulong),
+        ("fmtid_data2", ctypes.c_ushort),
+        ("fmtid_data3", ctypes.c_ushort),
+        ("fmtid_data4", ctypes.c_ubyte * 8),
+        ("pid", ctypes.c_ulong),
+    ]
+
+# DEVPKEY_Device_BatteryLifePercent: {104EA319-6EE2-4701-BD47-8DDBF425BBE5}, 2
+PKEY_BATTERY_PERCENT = DEVPROPKEY(
+    0x104EA319, 0x6EE2, 0x4701, (ctypes.c_ubyte * 8)(0xBD, 0x47, 0x8D, 0xDB, 0xF4, 0x25, 0xBB, 0xE5), 2
+)
+# DEVPKEY_Device_BatteryStatus: {104EA319-6EE2-4701-BD47-8DDBF425BBE5}, 3
+PKEY_BATTERY_STATUS = DEVPROPKEY(
+    0x104EA319, 0x6EE2, 0x4701, (ctypes.c_ubyte * 8)(0xBD, 0x47, 0x8D, 0xDB, 0xF4, 0x25, 0xBB, 0xE5), 3
+)
+# DEVPKEY_NAME: {B725F130-47EF-101A-A5F1-02608C9EEBAC}, 10
+PKEY_NAME = DEVPROPKEY(
+    0xB725F130, 0x47EF, 0x101A, (ctypes.c_ubyte * 8)(0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E, 0xEB, 0xAC), 10
+)
+# DEVPKEY_Device_FriendlyName: {A45C254E-DF1C-4EFD-8020-67D146A850E0}, 14
+PKEY_FRIENDLY_NAME = DEVPROPKEY(
+    0xA45C254E, 0xDF1C, 0x4EFD, (ctypes.c_ubyte * 8)(0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0), 14
+)
+
+@dataclass
+class EarphoneBatteryInfo:
+    """
+    Structured representation of wireless earphone battery metrics.
+    Strictly reports ONLY values actually exposed by Windows/hardware.
+    Never guesses, estimates, or synthesizes missing values.
+    """
+    overall: Optional[int] = None
+    left: Optional[int] = None
+    right: Optional[int] = None
+    case: Optional[int] = None
+    charging_overall: Optional[bool] = None
+    charging_left: Optional[bool] = None
+    charging_right: Optional[bool] = None
+    charging_case: Optional[bool] = None
+    is_live: bool = True
+    last_updated: Optional[float] = None
+    device_name: str = "Unknown"
+
+    def format_percentage(self, val: Optional[int]) -> str:
+        """Formats battery percentage, explicitly labeling stale values when disconnected."""
+        if val is None:
+            return "Not available"
+        if not self.is_live:
+            return f"Last known: {val}%"
+        return f"{val}%"
+
+    def format_charging(self, val: Optional[bool]) -> str:
+        """Formats charging status."""
+        if val is True:
+            return "Yes"
+        elif val is False:
+            return "No"
+        return "N/A"
+
+    def summary_str(self) -> str:
+        """Single-line summary formatted for logging."""
+        parts = []
+        if self.left is not None:
+            parts.append(f"Left={self.format_percentage(self.left)}")
+        if self.right is not None:
+            parts.append(f"Right={self.format_percentage(self.right)}")
+        if self.case is not None:
+            parts.append(f"Case={self.format_percentage(self.case)}")
+        if self.overall is not None:
+            parts.append(f"Overall={self.format_percentage(self.overall)}")
+        if not parts:
+            return "Not available"
+        status_tag = "" if self.is_live else " (Disconnected)"
+        return ", ".join(parts) + status_tag
+
+def query_bluetooth_battery(
+    target_names: Optional[Union[str, List[str]]] = None,
+    logger: Optional[logging.Logger] = None
+) -> EarphoneBatteryInfo:
+    """
+    Queries Windows Configuration Manager (cfgmgr32.dll) for Bluetooth battery percentage.
+    Reads PKEY_Device_BatteryLifePercent directly from the Windows PnP device tree.
+    Zero external packages required; standard user permissions.
+    """
+    info = EarphoneBatteryInfo()
+
+    if isinstance(target_names, str):
+        target_names_list = [target_names]
+    elif isinstance(target_names, (list, tuple)):
+        target_names_list = list(target_names)
+    else:
+        target_names_list = []
+
+    target_keywords = [t.lower().strip() for t in target_names_list if t and t.strip()]
+
+    try:
+        cfgmgr32 = ctypes.windll.cfgmgr32
+        ULONG = ctypes.c_ulong
+
+        buf_len = ULONG()
+        res = cfgmgr32.CM_Get_Device_ID_List_SizeW(ctypes.byref(buf_len), None, 0)
+        if res != 0 or buf_len.value <= 1:
+            return info
+
+        buf = ctypes.create_unicode_buffer(buf_len.value)
+        res = cfgmgr32.CM_Get_Device_ID_ListW(None, buf, buf_len.value, 0)
+        if res != 0:
+            return info
+
+        raw = ctypes.wstring_at(ctypes.addressof(buf), buf_len.value)
+        dev_ids = [
+            s for s in raw.split("\0")
+            if s and (s.startswith("BTHENUM\\") or s.startswith("BTHLE\\") or s.startswith("BTH\\"))
+        ]
+
+        for did in dev_ids:
+            dn = ULONG()
+            if cfgmgr32.CM_Locate_DevNodeW(ctypes.byref(dn), did, 0) != 0:
+                continue
+
+            prop_type = ULONG()
+            name_buf = ctypes.create_unicode_buffer(512)
+            name_size = ULONG(512)
+
+            r_name = cfgmgr32.CM_Get_DevNode_PropertyW(
+                dn, ctypes.byref(PKEY_NAME), ctypes.byref(prop_type), ctypes.byref(name_buf), ctypes.byref(name_size), 0
+            )
+            dev_name = name_buf.value if r_name == 0 else ""
+
+            if not dev_name:
+                name_size = ULONG(512)
+                r_fn = cfgmgr32.CM_Get_DevNode_PropertyW(
+                    dn, ctypes.byref(PKEY_FRIENDLY_NAME), ctypes.byref(prop_type), ctypes.byref(name_buf), ctypes.byref(name_size), 0
+                )
+                if r_fn == 0:
+                    dev_name = name_buf.value
+
+            dev_name_lower = dev_name.lower()
+            did_lower = did.lower()
+
+            matched = False
+            if not target_keywords:
+                matched = any(kw in dev_name_lower for kw in EARPHONE_KEYWORDS)
+            else:
+                for kw in target_keywords:
+                    clean_kw = kw.replace("headphones (", "").replace(")", "").strip()
+                    if clean_kw in dev_name_lower or clean_kw in did_lower or kw in dev_name_lower:
+                        matched = True
+                        break
+
+            if not matched:
+                continue
+
+            prop_buf = (ctypes.c_ubyte * 512)()
+            prop_size = ULONG(512)
+            r_batt = cfgmgr32.CM_Get_DevNode_PropertyW(
+                dn, ctypes.byref(PKEY_BATTERY_PERCENT), ctypes.byref(prop_type), prop_buf, ctypes.byref(prop_size), 0
+            )
+
+            if r_batt == 0 and prop_size.value >= 1:
+                batt_val = int(prop_buf[0])
+                if 0 <= batt_val <= 100:
+                    info.device_name = dev_name or "Bluetooth Earphone"
+                    info.last_updated = time.time()
+
+                    charging_val: Optional[bool] = None
+                    prop_size_st = ULONG(512)
+                    r_st = cfgmgr32.CM_Get_DevNode_PropertyW(
+                        dn, ctypes.byref(PKEY_BATTERY_STATUS), ctypes.byref(prop_type), prop_buf, ctypes.byref(prop_size_st), 0
+                    )
+                    if r_st == 0 and prop_size_st.value >= 1:
+                        st_code = int(prop_buf[0])
+                        if st_code == 3:
+                            charging_val = True
+                        elif st_code in (1, 2):
+                            charging_val = False
+
+                    if any(k in dev_name_lower or k in did_lower for k in ("left", "(l)", "- l", "_l_")):
+                        info.left = batt_val
+                        info.charging_left = charging_val
+                    elif any(k in dev_name_lower or k in did_lower for k in ("right", "(r)", "- r", "_r_")):
+                        info.right = batt_val
+                        info.charging_right = charging_val
+                    elif any(k in dev_name_lower or k in did_lower for k in ("case", "charging case", "(c)", "_case_")):
+                        info.case = batt_val
+                        info.charging_case = charging_val
+                    else:
+                        info.overall = batt_val
+                        info.charging_overall = charging_val
+
+        return info
+    except Exception as e:
+        if logger:
+            logger.debug("Failed querying Bluetooth battery from cfgmgr32: %s", e)
+        return info
+
+def print_battery_summary(info: EarphoneBatteryInfo, target_name: Optional[str] = None):
+    """Prints a clear, formatted summary of the wireless earphone battery status."""
+    print("\n" + "=" * 50)
+    print(" Wireless Earphone Status")
+    print("=" * 50)
+    if target_name:
+        print(f"Target:          {target_name}")
+    print(f"Device:          {info.device_name}")
+    conn_str = "Connected" if info.is_live and (info.overall is not None or info.left is not None) else "Disconnected / Standby"
+    print(f"Connection:      {conn_str}\n")
+    print(f"Left Earbud:     {info.format_percentage(info.left)}")
+    print(f"Right Earbud:    {info.format_percentage(info.right)}")
+    print(f"Charging Case:   {info.format_percentage(info.case)}")
+    if info.overall is not None or (info.left is None and info.right is None and info.case is None):
+        print(f"Overall Battery: {info.format_percentage(info.overall)}")
+    print("\nCharging:")
+    print(f"Left:            {info.format_charging(info.charging_left)}")
+    print(f"Right:           {info.format_charging(info.charging_right)}")
+    print(f"Case:            {info.format_charging(info.charging_case)}")
+    if info.overall is not None or (info.charging_left is None and info.charging_right is None and info.charging_case is None):
+        print(f"Overall:         {info.format_charging(info.charging_overall)}")
+    print("=" * 50 + "\n")
+
+# ==============================================================================
 # DEVICE ENUMERATION & CLI TESTING
 # ==============================================================================
 
@@ -400,6 +644,10 @@ class AudioAutoMuteMonitor(MMNotificationClient):
         mute_all_non_earphone: bool = False,
         restore_on_reconnect: bool = False,
         pause_media: bool = False,
+        battery_monitoring_enabled: bool = BATTERY_MONITORING_ENABLED,
+        battery_check_interval: float = BATTERY_CHECK_INTERVAL,
+        low_battery_warning_enabled: bool = LOW_BATTERY_WARNING_ENABLED,
+        low_battery_threshold: int = LOW_BATTERY_THRESHOLD,
         logger: Optional[logging.Logger] = None,
     ):
         super().__init__()
@@ -409,6 +657,10 @@ class AudioAutoMuteMonitor(MMNotificationClient):
         self.mute_all_non_earphone = mute_all_non_earphone
         self.restore_on_reconnect = restore_on_reconnect
         self.pause_media = pause_media
+        self.battery_monitoring_enabled = battery_monitoring_enabled
+        self.battery_check_interval = battery_check_interval
+        self.low_battery_warning_enabled = low_battery_warning_enabled
+        self.low_battery_threshold = low_battery_threshold
         self.logger = logger or logging.getLogger("AudioAutoMute")
 
         self.enumerator = AudioUtilities.GetDeviceEnumerator()
@@ -422,6 +674,11 @@ class AudioAutoMuteMonitor(MMNotificationClient):
         self.last_default_name: Optional[str] = None
         self.was_earphone_active_or_default: bool = False
         self.saved_device_states: Dict[str, dict] = {}
+
+        # Battery tracking
+        self.battery_info: EarphoneBatteryInfo = EarphoneBatteryInfo()
+        self._last_battery_check_time: float = 0.0
+        self._warned_low_battery: Dict[str, int] = {}
 
     def discover_tracked_earphone(self) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -523,6 +780,172 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                 self.logger.warning("Connect your wireless earphones or configure EARPHONE_DEVICE_NAME.")
 
             self.logger.info("Current default playback output: '%s'", self.last_default_name or "None")
+
+            # Initial battery query
+            if self.battery_monitoring_enabled:
+                self.refresh_battery(force=True)
+
+    def check_low_battery_warnings(self, info: EarphoneBatteryInfo):
+        """
+        Evaluates battery levels against LOW_BATTERY_THRESHOLD.
+        Emits warnings once when threshold is breached; suppresses spam until recharged.
+        """
+        if not self.low_battery_warning_enabled or not info.is_live:
+            return
+
+        checks = [
+            ("Left earbud", info.left),
+            ("Right earbud", info.right),
+            ("Charging case", info.case),
+            ("Wireless earphone", info.overall),
+        ]
+
+        for label, val in checks:
+            if val is None:
+                continue
+            if val <= self.low_battery_threshold:
+                last_warned = self._warned_low_battery.get(label)
+                if last_warned is None or val < last_warned - 5:
+                    self.logger.warning("WARNING: %s battery is low: %d%%", label, val)
+                    self._warned_low_battery[label] = val
+            else:
+                if label in self._warned_low_battery and val > self.low_battery_threshold + 5:
+                    del self._warned_low_battery[label]
+
+    def refresh_battery(self, force: bool = False) -> EarphoneBatteryInfo:
+        """
+        Safely queries Windows Bluetooth PnP properties for battery percentage.
+        Guaranteed never to throw or interrupt audio auto-mute functionality.
+        """
+        if not self.battery_monitoring_enabled:
+            return self.battery_info
+
+        now = time.monotonic()
+        if not force and (now - self._last_battery_check_time < self.battery_check_interval):
+            return self.battery_info
+
+        self._last_battery_check_time = now
+
+        try:
+            candidates: List[str] = []
+            if self.target_earphone_name:
+                if isinstance(self.target_earphone_name, str):
+                    candidates.append(self.target_earphone_name)
+                else:
+                    candidates.extend(self.target_earphone_name)
+            if self.tracked_earphone_name and self.tracked_earphone_name not in candidates:
+                candidates.append(self.tracked_earphone_name)
+
+            new_info = query_bluetooth_battery(
+                target_names=candidates if candidates else None,
+                logger=self.logger,
+            )
+
+            earphone_active = False
+            if self.tracked_earphone_id:
+                earphone_active = is_device_active(self.enumerator, self.tracked_earphone_id)
+            new_info.is_live = earphone_active
+
+            # Preserve last known values if disconnected
+            if not new_info.is_live:
+                if new_info.overall is None and self.battery_info.overall is not None:
+                    new_info.overall = self.battery_info.overall
+                if new_info.left is None and self.battery_info.left is not None:
+                    new_info.left = self.battery_info.left
+                if new_info.right is None and self.battery_info.right is not None:
+                    new_info.right = self.battery_info.right
+                if new_info.case is None and self.battery_info.case is not None:
+                    new_info.case = self.battery_info.case
+
+            # Check if levels changed significantly
+            changed = (
+                new_info.overall != self.battery_info.overall or
+                new_info.left != self.battery_info.left or
+                new_info.right != self.battery_info.right or
+                new_info.case != self.battery_info.case or
+                new_info.is_live != self.battery_info.is_live
+            )
+
+            self.battery_info = new_info
+
+            if changed and (new_info.overall is not None or new_info.left is not None or new_info.right is not None or new_info.case is not None):
+                self.logger.info("Battery status: %s", new_info.summary_str())
+
+            self.check_low_battery_warnings(new_info)
+            return self.battery_info
+        except Exception as e:
+            self.logger.debug("Battery refresh note: %s", e)
+            return self.battery_info
+
+    def format_status_display(self) -> str:
+        """Generates the comprehensive status display matching Section 19 layout."""
+        earphone_active = is_device_active(self.enumerator, self.tracked_earphone_id) if self.tracked_earphone_id else False
+        conn_str = "Connected" if earphone_active else "Disconnected"
+
+        cur_def_id, cur_def_name = get_default_render_device(self.enumerator)
+        def_name = cur_def_name or "None"
+        def_status = "Active" if cur_def_id else "Inactive"
+
+        b = self.battery_info
+        left_str = b.format_percentage(b.left)
+        right_str = b.format_percentage(b.right)
+        case_str = b.format_percentage(b.case)
+        overall_str = b.format_percentage(b.overall)
+
+        lines = [
+            "=" * 50,
+            " Windows Wireless Earphone Monitor",
+            "=" * 50,
+            "",
+            "Application: Running",
+            "Persistence: Disabled",
+            "Startup:     Disabled",
+            "Admin:       Not required",
+            "",
+            "Earphones",
+            "-" * 50,
+            f"Connection:       {conn_str}",
+            f"Device:           {self.tracked_earphone_name or 'Auto-Detect'}",
+            f"Left Earbud:      {left_str}",
+            f"Right Earbud:     {right_str}",
+            f"Charging Case:    {case_str}",
+        ]
+        if b.overall is not None or (b.left is None and b.right is None and b.case is None):
+            lines.append(f"Overall Battery:  {overall_str}")
+
+        if any(c is not None for c in (b.charging_left, b.charging_right, b.charging_case, b.charging_overall)):
+            lines.append("")
+            lines.append("Charging:")
+            if b.charging_left is not None:
+                lines.append(f"Left:            {b.format_charging(b.charging_left)}")
+            if b.charging_right is not None:
+                lines.append(f"Right:           {b.format_charging(b.charging_right)}")
+            if b.charging_case is not None:
+                lines.append(f"Case:            {b.format_charging(b.charging_case)}")
+            if b.charging_overall is not None and b.charging_left is None and b.charging_right is None:
+                lines.append(f"Overall:         {b.format_charging(b.charging_overall)}")
+
+        lines.extend([
+            "",
+            "Default Output",
+            "-" * 50,
+            f"Device:           {def_name}",
+            f"Status:           {def_status}",
+            "",
+            "Audio Protection",
+            "-" * 50,
+            f"Status:           {'Armed' if self.was_earphone_active_or_default else 'Standby'}",
+            f"Mute-on-disconnect: {'Enabled' if self.mute_new_default_only else 'Disabled'}",
+            "",
+            "Battery Monitor",
+            "-" * 50,
+            f"Status:           {'Active' if self.battery_monitoring_enabled else 'Disabled'}",
+            f"Refresh interval: {int(self.battery_check_interval)} seconds",
+            "",
+            "Waiting for changes...",
+            "=" * 50,
+        ])
+        return "\n".join(lines)
 
     def register_callbacks(self):
         """Registers the IMMNotificationClient COM callback with Windows Core Audio."""
@@ -685,6 +1108,12 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                 self.was_earphone_active_or_default = False
                 self.last_default_id = cur_def_id
                 self.last_default_name = cur_def_name
+
+                # Mark battery status as disconnected (preserving last known values)
+                self.battery_info.is_live = False
+                if self.battery_info.overall is not None or self.battery_info.left is not None or self.battery_info.right is not None or self.battery_info.case is not None:
+                    self.logger.info("Earphones disconnected. Battery values marked as last known: %s", self.battery_info.summary_str())
+
                 self.logger.info("[STANDBY] Protection armed standby. Waiting for earphones to reconnect...")
                 return
 
@@ -716,6 +1145,11 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                 self.was_earphone_active_or_default = True
                 self.logger.info("[ARMED] Earphones are active. Laptop speakers will be muted if disconnected.")
 
+                # Refresh battery immediately on reconnection
+                if self.battery_monitoring_enabled:
+                    self.logger.info("Earphones connected. Refreshing battery status...")
+                    self.refresh_battery(force=True)
+
                 # Optional restoration
                 if self.restore_on_reconnect and self.saved_device_states:
                     self.logger.info("Restoring previous audio states for muted devices...")
@@ -734,7 +1168,7 @@ class AudioAutoMuteMonitor(MMNotificationClient):
     def heartbeat_check(self):
         """
         Periodic fail-safe check run in the main thread loop.
-        Re-acquires COM enumerator and re-registers callbacks if invalid (e.g. after laptop sleep).
+        Re-acquires COM enumerator if invalid and refreshes battery at configured intervals.
         """
         with self._lock:
             try:
@@ -753,6 +1187,12 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                         self.logger.debug("Re-registration note: %s", re_err)
             except Exception as e:
                 self.logger.debug("Heartbeat sync note: %s", e)
+
+            # Battery monitoring interval check
+            if self.battery_monitoring_enabled:
+                now = time.monotonic()
+                if now - self._last_battery_check_time >= self.battery_check_interval:
+                    self.refresh_battery()
 
 # ==============================================================================
 # MAIN APPLICATION CONTROLLER
@@ -794,6 +1234,22 @@ def main():
         action="store_true",
         help="Send a Windows Media Play/Pause key event on disconnect to pause background playback."
     )
+    parser.add_argument(
+        "--battery",
+        action="store_true",
+        help="Query and display connected wireless earphone battery percentage, then exit."
+    )
+    parser.add_argument(
+        "--no-battery",
+        action="store_true",
+        help="Disable background earphone battery monitoring."
+    )
+    parser.add_argument(
+        "--battery-interval",
+        type=float,
+        default=None,
+        help="Override BATTERY_CHECK_INTERVAL in seconds (default: 30.0)."
+    )
     args = parser.parse_args()
 
     if args.list_devices:
@@ -808,18 +1264,16 @@ def main():
     effective_id = args.device_id if args.device_id is not None else EARPHONE_DEVICE_ID
     effective_restore = True if args.restore else RESTORE_ON_EARPHONE_RECONNECT
     effective_pause = True if args.pause_media else PAUSE_MEDIA_ON_DISCONNECT
+    effective_battery_enabled = False if args.no_battery else BATTERY_MONITORING_ENABLED
+    effective_battery_interval = args.battery_interval if args.battery_interval is not None else BATTERY_CHECK_INTERVAL
+
+    if args.battery:
+        logger = setup_logger("ERROR", None)
+        info = query_bluetooth_battery(target_names=effective_name, logger=logger)
+        print_battery_summary(info, str(effective_name) if effective_name else None)
+        return 0
 
     logger = setup_logger(LOG_LEVEL, LOG_FILE)
-
-    print("\n" + "=" * 65)
-    print(" Windows Audio Auto-Mute Guardian")
-    print("=" * 65)
-    print(" Status: ACTIVE (Monitoring audio device events)")
-    print(" Mode:   Non-persistent (Active ONLY while running)")
-    print(" Exit:   Press Ctrl+C at any time to stop cleanly")
-    print("=" * 65 + "\n")
-
-    logger.info("Starting Audio Auto-Mute Guardian...")
 
     monitor = AudioAutoMuteMonitor(
         earphone_name=effective_name,
@@ -828,11 +1282,18 @@ def main():
         mute_all_non_earphone=MUTE_ALL_NON_EARPHONE_OUTPUTS,
         restore_on_reconnect=effective_restore,
         pause_media=effective_pause,
+        battery_monitoring_enabled=effective_battery_enabled,
+        battery_check_interval=effective_battery_interval,
+        low_battery_warning_enabled=LOW_BATTERY_WARNING_ENABLED,
+        low_battery_threshold=LOW_BATTERY_THRESHOLD,
         logger=logger,
     )
 
     monitor.initialize_state()
     monitor.register_callbacks()
+
+    # Print comprehensive status dashboard matching Section 19 layout
+    print("\n" + monitor.format_status_display() + "\n")
 
     shutdown_event = threading.Event()
 

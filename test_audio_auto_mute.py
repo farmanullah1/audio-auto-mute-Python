@@ -221,6 +221,155 @@ class TestAudioMuteGuardian(unittest.TestCase):
             self.assertEqual(dev_id, "{guid-ronin}")
             self.assertEqual(name, "Headphones (RONiN ECLIPSE)")
 
+    # --------------------------------------------------------------------------
+    # Wireless Earphone Battery Monitoring Tests
+    # --------------------------------------------------------------------------
+
+    def test_battery_info_formatting_live(self):
+        """Verify battery percentage formatting when live/connected."""
+        info = aam.EarphoneBatteryInfo(
+            overall=85,
+            left=82,
+            right=76,
+            case=64,
+            charging_overall=False,
+            charging_left=False,
+            charging_right=False,
+            charging_case=True,
+            is_live=True
+        )
+        self.assertEqual(info.format_percentage(info.overall), "85%")
+        self.assertEqual(info.format_percentage(info.left), "82%")
+        self.assertEqual(info.format_percentage(info.right), "76%")
+        self.assertEqual(info.format_percentage(info.case), "64%")
+        self.assertEqual(info.format_percentage(None), "Not available")
+        self.assertEqual(info.format_charging(True), "Yes")
+        self.assertEqual(info.format_charging(False), "No")
+        self.assertEqual(info.format_charging(None), "N/A")
+        self.assertIn("Left=82%", info.summary_str())
+        self.assertIn("Right=76%", info.summary_str())
+        self.assertIn("Case=64%", info.summary_str())
+        self.assertNotIn("Last known", info.summary_str())
+
+    def test_battery_info_formatting_stale_when_disconnected(self):
+        """Verify that disconnected earphones label battery values as Last known."""
+        info = aam.EarphoneBatteryInfo(
+            overall=85,
+            left=82,
+            right=76,
+            case=64,
+            is_live=False
+        )
+        self.assertEqual(info.format_percentage(info.overall), "Last known: 85%")
+        self.assertEqual(info.format_percentage(info.left), "Last known: 82%")
+        self.assertEqual(info.format_percentage(info.right), "Last known: 76%")
+        self.assertEqual(info.format_percentage(info.case), "Last known: 64%")
+        self.assertIn("(Disconnected)", info.summary_str())
+        self.assertIn("Last known", info.summary_str())
+
+    def test_battery_never_guessed_or_fabricated(self):
+        """Ensure missing components evaluate to None and format as Not available."""
+        # Single HFP device reports only overall
+        info = aam.EarphoneBatteryInfo(overall=100, is_live=True)
+        self.assertIsNone(info.left)
+        self.assertIsNone(info.right)
+        self.assertIsNone(info.case)
+        self.assertEqual(info.format_percentage(info.left), "Not available")
+        self.assertEqual(info.format_percentage(info.right), "Not available")
+        self.assertEqual(info.format_percentage(info.case), "Not available")
+        self.assertEqual(info.format_percentage(info.overall), "100%")
+
+    def test_low_battery_warning_trigger_and_anti_spam_latch(self):
+        """Verify that low battery warning logs once and suppresses spam until state changes."""
+        self.monitor.low_battery_warning_enabled = True
+        self.monitor.low_battery_threshold = 20
+
+        # Step 1: Battery drops to 18% -> warning triggered
+        info1 = aam.EarphoneBatteryInfo(overall=18, left=18, is_live=True)
+        self.monitor.check_low_battery_warnings(info1)
+        self.assertEqual(self.logger.warning.call_count, 2)  # Left earbud + Wireless earphone
+
+        # Step 2: Next check, battery still at 18% -> NO duplicate warning (anti-spam)
+        self.logger.warning.reset_mock()
+        self.monitor.check_low_battery_warnings(info1)
+        self.logger.warning.assert_not_called()
+
+        # Step 3: Battery drops by > 5% (to 12%) -> triggers update warning
+        info2 = aam.EarphoneBatteryInfo(overall=12, left=12, is_live=True)
+        self.monitor.check_low_battery_warnings(info2)
+        self.assertEqual(self.logger.warning.call_count, 2)
+
+        # Step 4: Recharged to 40% -> warning latch clears
+        self.logger.warning.reset_mock()
+        info3 = aam.EarphoneBatteryInfo(overall=40, left=40, is_live=True)
+        self.monitor.check_low_battery_warnings(info3)
+        self.logger.warning.assert_not_called()
+        self.assertNotIn("Left earbud", self.monitor._warned_low_battery)
+        self.assertNotIn("Wireless earphone", self.monitor._warned_low_battery)
+
+    def test_case_low_battery_warning(self):
+        """Verify charging case low-battery warning when case battery is available."""
+        self.monitor.low_battery_warning_enabled = True
+        self.monitor.low_battery_threshold = 20
+        info = aam.EarphoneBatteryInfo(case=15, is_live=True)
+        self.monitor.check_low_battery_warnings(info)
+        self.logger.warning.assert_called_with("WARNING: %s battery is low: %d%%", "Charging case", 15)
+
+    def test_low_battery_warning_disabled_when_disconnected(self):
+        """Verify low battery warnings are suppressed when device is disconnected."""
+        self.monitor.low_battery_warning_enabled = True
+        self.monitor.low_battery_threshold = 20
+        info = aam.EarphoneBatteryInfo(overall=10, is_live=False)
+        self.monitor.check_low_battery_warnings(info)
+        self.logger.warning.assert_not_called()
+
+    def test_disconnect_marks_battery_last_known(self):
+        """Verify disconnect transition marks battery status as not live."""
+        self.monitor.was_earphone_active_or_default = True
+        self.monitor.last_default_id = "{earphone-guid-1234}"
+        self.monitor.battery_info = aam.EarphoneBatteryInfo(overall=90, is_live=True)
+
+        with patch("audio_auto_mute.get_default_render_device", return_value=("{speaker-guid}", "Speakers")), \
+             patch("audio_auto_mute.is_device_active", return_value=False), \
+             patch("audio_auto_mute.mute_endpoint"):
+            self.monitor._process_state_transition("Disconnect event")
+            self.assertFalse(self.monitor.battery_info.is_live)
+            self.assertEqual(self.monitor.battery_info.overall, 90)
+
+    def test_reconnect_triggers_battery_refresh(self):
+        """Verify earphone reconnect triggers immediate battery refresh."""
+        self.monitor.was_earphone_active_or_default = False
+        self.monitor.battery_monitoring_enabled = True
+
+        with patch("audio_auto_mute.get_default_render_device", return_value=("{earphone-guid-1234}", "Headphones (RONiN ECLIPSE)")), \
+             patch("audio_auto_mute.is_device_active", return_value=True), \
+             patch.object(self.monitor, "refresh_battery") as mock_refresh:
+            self.monitor._process_state_transition("Reconnect event")
+            mock_refresh.assert_called_once_with(force=True)
+
+    def test_audio_auto_mute_resilient_to_battery_failure(self):
+        """Verify that any battery query error does NOT interrupt auto-mute protection."""
+        self.monitor.was_earphone_active_or_default = True
+        self.monitor.last_default_id = "{earphone-guid-1234}"
+
+        with patch("audio_auto_mute.get_default_render_device", return_value=("{speaker-guid}", "Speakers")), \
+             patch("audio_auto_mute.is_device_active", return_value=False), \
+             patch("audio_auto_mute.mute_endpoint") as mock_mute, \
+             patch.object(self.monitor, "refresh_battery", side_effect=RuntimeError("Simulated Bluetooth failure")):
+            self.monitor._process_state_transition("Disconnect event")
+            mock_mute.assert_called_once()
+            self.assertFalse(self.monitor.was_earphone_active_or_default)
+
+    def test_format_status_display(self):
+        """Verify terminal status display formatting contains required sections."""
+        self.monitor.battery_info = aam.EarphoneBatteryInfo(overall=100, is_live=True)
+        display = self.monitor.format_status_display()
+        self.assertIn("Windows Wireless Earphone Monitor", display)
+        self.assertIn("Overall Battery:  100%", display)
+        self.assertIn("Battery Monitor", display)
+        self.assertIn("Audio Protection", display)
+
 
 if __name__ == "__main__":
     unittest.main()
+
