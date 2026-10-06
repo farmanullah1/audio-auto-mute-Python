@@ -370,6 +370,150 @@ class TestAudioMuteGuardian(unittest.TestCase):
         self.assertIn("Audio Protection", display)
 
 
+    def test_mute_endpoint_with_safe_volume_cap(self):
+        """Verify that mute_endpoint caps master volume level when safe_volume_cap is provided."""
+        saved = {}
+        mock_enum = MagicMock()
+        mock_imm = MagicMock()
+        mock_enum.GetDevice.return_value = mock_imm
+        mock_dev = MagicMock()
+        mock_vol = MagicMock()
+        mock_vol.GetMute.return_value = 0
+        mock_vol.GetMasterVolumeLevelScalar.return_value = 0.80  # 80% volume
+        mock_dev.EndpointVolume = mock_vol
+
+        with patch("audio_auto_mute.AudioUtilities.CreateDevice", return_value=mock_dev):
+            res = aam.mute_endpoint(mock_enum, "dev_spk", "Speakers", saved, self.logger, safe_volume_cap=15)
+            self.assertTrue(res)
+            mock_vol.SetMute.assert_called_once_with(1, None)
+            mock_vol.SetMasterVolumeLevelScalar.assert_called_once_with(0.15, None)
+            self.assertTrue(saved["dev_spk"]["volume_reduced"])
+            self.assertEqual(saved["dev_spk"]["previous_vol"], 0.80)
+
+    def test_restore_endpoint_restores_volume(self):
+        """Verify that restore_endpoint restores previous volume scalar if volume was reduced."""
+        mock_enum = MagicMock()
+        mock_imm = MagicMock()
+        mock_enum.GetDevice.return_value = mock_imm
+        mock_dev = MagicMock()
+        mock_vol = MagicMock()
+        mock_dev.EndpointVolume = mock_vol
+        saved = {
+            "dev_spk": {
+                "name": "Speakers",
+                "script_muted": True,
+                "previous_mute": False,
+                "previous_vol": 0.85,
+                "volume_reduced": True,
+            }
+        }
+        with patch("audio_auto_mute.AudioUtilities.CreateDevice", return_value=mock_dev):
+            res = aam.restore_endpoint(mock_enum, "dev_spk", saved, self.logger)
+            self.assertTrue(res)
+            mock_vol.SetMute.assert_called_once_with(0, None)
+            mock_vol.SetMasterVolumeLevelScalar.assert_called_once_with(0.85, None)
+            self.assertFalse(saved["dev_spk"]["volume_reduced"])
+
+    def test_show_desktop_notification_non_blocking(self):
+        """Verify show_desktop_notification spawns a worker thread and does not raise."""
+        with patch("subprocess.run") as mock_sub:
+            aam.show_desktop_notification("Test Title", "Test Message", self.logger)
+            import time
+            time.sleep(0.05)
+            mock_sub.assert_called_once()
+            args, kwargs = mock_sub.call_args
+            self.assertEqual(args[0][0], "powershell")
+            self.assertIn("Test Title", args[0][5])
+
+    def test_com_callback_on_default_device_changed(self):
+        """Verify on_default_device_changed filters flow_id and processes transitions."""
+        with patch.object(self.monitor, "_process_state_transition") as mock_trans:
+            # flow_id == 1 (eCapture / microphone) -> should ignore
+            self.monitor.on_default_device_changed("eCapture", 1, "eConsole", 0, "{mic-guid}")
+            mock_trans.assert_not_called()
+
+            # flow_id == 0 (eRender / playback) -> should process
+            self.monitor.on_default_device_changed("eRender", 0, "eConsole", 0, "{spk-guid}")
+            mock_trans.assert_called_once_with(
+                trigger_reason="Windows default device changed (role=eConsole)",
+                new_default_id="{spk-guid}"
+            )
+
+    def test_com_callback_on_device_state_changed(self):
+        """Verify on_device_state_changed triggers transition for monitored earphone."""
+        with patch.object(self.monitor, "_process_state_transition") as mock_trans:
+            # Unrelated device -> does not trigger
+            self.monitor.on_device_state_changed("{other-guid}", "ACTIVE", 1)
+            mock_trans.assert_not_called()
+
+            # Monitored earphone -> triggers transition
+            self.monitor.on_device_state_changed("{earphone-guid-1234}", "UNPLUGGED", 8)
+            mock_trans.assert_called_once_with(
+                trigger_reason="Earphone hardware state changed to UNPLUGGED"
+            )
+
+    def test_com_callback_on_device_removed(self):
+        """Verify on_device_removed triggers transition when earphone is removed."""
+        with patch.object(self.monitor, "_process_state_transition") as mock_trans:
+            self.monitor.on_device_removed("{earphone-guid-1234}")
+            mock_trans.assert_called_once_with(trigger_reason="Earphone endpoint removed")
+
+    def test_multi_device_list_detection_prioritizes_active(self):
+        """Verify that an active device is prioritized over an unplugged candidate."""
+        monitor = aam.AudioAutoMuteMonitor(
+            earphone_name=["Sony WH-1000XM4", "RONiN ECLIPSE"],
+            logger=self.logger
+        )
+        mock_enum = MagicMock()
+        mock_imm_sony = MagicMock()
+        mock_imm_sony.GetState.return_value = 8  # Unplugged
+        mock_dev_sony = MagicMock()
+        mock_dev_sony.id = "{guid-sony}"
+        mock_dev_sony.FriendlyName = "Headphones (Sony WH-1000XM4)"
+
+        mock_imm_ronin = MagicMock()
+        mock_imm_ronin.GetState.return_value = 1  # Active!
+        mock_dev_ronin = MagicMock()
+        mock_dev_ronin.id = "{guid-ronin}"
+        mock_dev_ronin.FriendlyName = "Headphones (RONiN ECLIPSE)"
+
+        mock_collection = MagicMock()
+        mock_collection.GetCount.return_value = 2
+        mock_collection.Item.side_effect = [mock_imm_sony, mock_imm_ronin]
+        mock_enum.EnumAudioEndpoints.return_value = mock_collection
+        monitor.enumerator = mock_enum
+
+        with patch("audio_auto_mute.AudioUtilities.CreateDevice", side_effect=[mock_dev_sony, mock_dev_ronin]):
+            dev_id, name = monitor.discover_tracked_earphone()
+            # Must return the active RONiN ECLIPSE, NOT the unplugged Sony
+            self.assertEqual(dev_id, "{guid-ronin}")
+            self.assertEqual(name, "Headphones (RONiN ECLIPSE)")
+
+    def test_trigger_media_pause_calls_extended_key(self):
+        """Verify trigger_media_pause sends KEYEVENTF_EXTENDEDKEY (0x0001)."""
+        with patch("ctypes.windll.user32.keybd_event") as mock_keybd:
+            aam.trigger_media_pause(self.logger)
+            self.assertEqual(mock_keybd.call_count, 2)
+            # Check keydown: 0xB3, 0, 0x0001, 0
+            mock_keybd.assert_any_call(0xB3, 0, 0x0001, 0)
+            # Check keyup: 0xB3, 0, 0x0001 | 0x0002, 0
+            mock_keybd.assert_any_call(0xB3, 0, 0x0003, 0)
+
+    def test_sleep_recovery_reacquisition_on_rpc_error(self):
+        """Verify heartbeat_check re-acquires enumerator when RPC server is unavailable."""
+        import comtypes
+        mock_err = comtypes.COMError(-2147023174, "RPC Server Unavailable", None)
+        self.monitor.enumerator = MagicMock()
+        self.monitor.enumerator.GetDefaultAudioEndpoint.side_effect = mock_err
+
+        mock_new_enum = MagicMock()
+        with patch("audio_auto_mute.AudioUtilities.GetDeviceEnumerator", return_value=mock_new_enum), \
+             patch.object(self.monitor, "_process_state_transition"):
+            self.monitor.heartbeat_check()
+            self.assertEqual(self.monitor.enumerator, mock_new_enum)
+            mock_new_enum.RegisterEndpointNotificationCallback.assert_called_once_with(self.monitor)
+
+
 if __name__ == "__main__":
     unittest.main()
 
