@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import re
 import signal
 import threading
 import time
@@ -167,9 +168,10 @@ def trigger_media_pause(logger: logging.Logger):
     """
     try:
         VK_MEDIA_PLAY_PAUSE = 0xB3
+        KEYEVENTF_EXTENDEDKEY = 0x0001
         KEYEVENTF_KEYUP = 0x0002
-        ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_KEYUP, 0)
+        ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY, 0)
+        ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
         logger.info("Sent Windows Media Pause (VK_MEDIA_PLAY_PAUSE) event.")
     except Exception as e:
         logger.warning("Could not simulate media pause: %s", e)
@@ -487,7 +489,13 @@ def query_bluetooth_battery(
                 matched = any(kw in dev_name_lower for kw in EARPHONE_KEYWORDS)
             else:
                 for kw in target_keywords:
-                    clean_kw = kw.replace("headphones (", "").replace(")", "").strip()
+                    # Strip common audio device wrapper prefixes (e.g. "Headphones (...)", "Headset (...)")
+                    clean_kw = re.sub(
+                        r"^(?:headphones|headset|earphones|earbuds|speakers|audio)\s*\((.*?)\)$",
+                        r"\1",
+                        kw,
+                        flags=re.IGNORECASE
+                    ).strip()
                     if clean_kw in dev_name_lower or clean_kw in did_lower or kw in dev_name_lower:
                         matched = True
                         break
@@ -710,6 +718,14 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                 if isinstance(self.target_earphone_name, str)
                 else self.target_earphone_name
             )
+            # Pass 1: Prioritize Active endpoints (State 1 = Active / connected)
+            for target in target_list:
+                target_lower = target.lower().strip()
+                for dev_id, name, state in candidates:
+                    if state == 1 and target_lower in name.lower():
+                        return dev_id, name
+
+            # Pass 2: Fallback to any state (e.g. Unplugged / Standby)
             for target in target_list:
                 target_lower = target.lower().strip()
                 for dev_id, name, state in candidates:
@@ -723,25 +739,32 @@ class AudioAutoMuteMonitor(MMNotificationClient):
             if any(kw in cur_def_lower for kw in EARPHONE_KEYWORDS):
                 return cur_def_id, cur_def_name
 
-        # 4. Auto-detect from paired/connected devices (State 1 = Active, State 8 = Unplugged)
+        # 4. Auto-detect from paired/connected devices
         # Prioritize wireless/Bluetooth earphones over motherboard audio chips
         generic_chips = ("realtek", "high definition audio", "intel(r)", "amd ")
 
-        # 4a. Active or Unplugged devices matching earphone keywords, NOT generic motherboard chips
+        # 4a. Active (State 1) devices matching earphone keywords, NOT generic motherboard chips
         for dev_id, name, state in candidates:
-            if state in (1, 8):
+            if state == 1:
                 name_lower = name.lower()
                 if any(kw in name_lower for kw in EARPHONE_KEYWORDS) and not any(chip in name_lower for chip in generic_chips):
                     return dev_id, name
 
-        # 4b. Any Active or Unplugged device matching earphone keywords
+        # 4b. Unplugged/Standby (State 8) devices matching earphone keywords, NOT generic motherboard chips
         for dev_id, name, state in candidates:
-            if state in (1, 8):
+            if state == 8:
+                name_lower = name.lower()
+                if any(kw in name_lower for kw in EARPHONE_KEYWORDS) and not any(chip in name_lower for chip in generic_chips):
+                    return dev_id, name
+
+        # 4c. Any Active device matching earphone keywords
+        for dev_id, name, state in candidates:
+            if state == 1:
                 name_lower = name.lower()
                 if any(kw in name_lower for kw in EARPHONE_KEYWORDS):
                     return dev_id, name
 
-        # 4c. Fallback across all states
+        # 4d. Fallback across all states
         for dev_id, name, state in candidates:
             name_lower = name.lower()
             if any(kw in name_lower for kw in EARPHONE_KEYWORDS):
@@ -1044,27 +1067,23 @@ class AudioAutoMuteMonitor(MMNotificationClient):
         if self.tracked_earphone_id:
             earphone_active = is_device_active(self.enumerator, self.tracked_earphone_id)
 
-        self.logger.debug(
-            "Evaluation (%s): cur_def='%s', earphone_active=%s, was_active=%s",
-            trigger_reason,
-            cur_def_name,
-            earphone_active,
-            self.was_earphone_active_or_default
-        )
-
         # ----------------------------------------------------------------------
         # CASE 1: EARPHONES DISCONNECTED (Scenario A)
         # ----------------------------------------------------------------------
         if self.was_earphone_active_or_default and not earphone_active:
-            # If earphones disconnected but Windows hasn't finished switching the default endpoint yet,
-            # wait up to 100ms (5 x 20ms) to catch the new default output immediately.
-            if cur_def_id == self.tracked_earphone_id:
-                for _ in range(5):
+            # If earphones disconnected but Windows hasn't finished switching the default endpoint yet
+            # (or cur_def_id is None during device teardown), micro-wait up to 200ms (10 x 20ms)
+            # to catch the newly assigned speaker endpoint immediately.
+            if not cur_def_id or cur_def_id == self.tracked_earphone_id:
+                for _ in range(10):
                     time.sleep(0.02)
                     new_id, new_name = get_default_render_device(self.enumerator)
                     if new_id and new_id != self.tracked_earphone_id:
                         cur_def_id, cur_def_name = new_id, new_name
                         break
+
+            if not cur_def_id:
+                return
 
             if cur_def_id != self.tracked_earphone_id:
                 self.logger.warning(
@@ -1171,13 +1190,14 @@ class AudioAutoMuteMonitor(MMNotificationClient):
         Re-acquires COM enumerator if invalid and refreshes battery at configured intervals.
         """
         with self._lock:
+            # Proactively ping enumerator to detect RPC Server Unavailable (0x800706BA) after sleep/wake
             try:
-                self._process_state_transition(trigger_reason="Heartbeat sync")
+                self.enumerator.GetDefaultAudioEndpoint(0, 0)
             except (comtypes.COMError, OSError) as e:
-                # 0x800706BA: RPC Server Unavailable / Sleep wake
                 hr = getattr(e, "hresult", 0)
-                if hr in (-2147023174, -2147467259):
-                    self.logger.warning("Re-acquiring Windows Audio COM enumerator after system wake/disconnect...")
+                # 0x800706BA: RPC Server Unavailable, 0x80010108: RPC Disconnected, 0x80004005: E_FAIL
+                if hr in (-2147023174, -2147417848, -2147467259):
+                    self.logger.warning("Windows Audio COM service reconnected after system sleep/wake. Re-acquiring...")
                     try:
                         self.enumerator = AudioUtilities.GetDeviceEnumerator()
                         self.enumerator.RegisterEndpointNotificationCallback(self)
@@ -1185,6 +1205,9 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                         self.logger.info("Successfully re-registered audio event notifications after system wake.")
                     except Exception as re_err:
                         self.logger.debug("Re-registration note: %s", re_err)
+
+            try:
+                self._process_state_transition(trigger_reason="Heartbeat sync")
             except Exception as e:
                 self.logger.debug("Heartbeat sync note: %s", e)
 
