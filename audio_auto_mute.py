@@ -30,6 +30,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import re
 import signal
+import subprocess
 import threading
 import time
 from typing import Dict, List, Optional, Tuple, Union
@@ -78,6 +79,18 @@ RESTORE_ON_EARPHONE_RECONNECT: bool = False
 # when earphones disconnect to pause background YouTube, Spotify, or media playback.
 # Default: False (leaves media players untouched unless requested).
 PAUSE_MEDIA_ON_DISCONNECT: bool = False
+
+# Optional Desktop Notification:
+# If True, displays a native Windows desktop toast notification when earphones disconnect and speakers are muted.
+# Default: True.
+NOTIFY_ON_DISCONNECT: bool = True
+
+# Optional Safe Volume Cap:
+# If set to an integer percentage (e.g., 15), lowers the speaker volume slider to this percentage
+# upon disconnect in addition to muting. Protects against sudden sound bursts if accidentally unmuted.
+# Set to None to keep the existing speaker volume level unchanged.
+# Default: None.
+SAFE_VOLUME_CAP: Optional[int] = None
 
 # Heartbeat interval in seconds. Event-driven callbacks handle transitions in real-time
 # (< 20ms); this interval provides a lightweight fail-safe sync and ensures
@@ -164,7 +177,7 @@ def setup_logger(log_level: str, log_file: Optional[str] = None) -> logging.Logg
 def trigger_media_pause(logger: logging.Logger):
     """
     Simulates a standard Windows VK_MEDIA_PLAY_PAUSE keypress to pause active media.
-    Uses native user32.keybd_event without external packages.
+    Uses native user32.keybd_event with KEYEVENTF_EXTENDEDKEY without external packages.
     """
     try:
         VK_MEDIA_PLAY_PAUSE = 0xB3
@@ -175,6 +188,44 @@ def trigger_media_pause(logger: logging.Logger):
         logger.info("Sent Windows Media Pause (VK_MEDIA_PLAY_PAUSE) event.")
     except Exception as e:
         logger.warning("Could not simulate media pause: %s", e)
+
+def show_desktop_notification(title: str, message: str, logger: Optional[logging.Logger] = None):
+    """
+    Displays a native Windows toast notification asynchronously with zero external packages.
+    Runs entirely in a background daemon thread without blocking audio muting.
+    """
+    def _worker():
+        try:
+            escaped_title = (
+                title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+            )
+            escaped_msg = (
+                message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+            )
+            ps_command = (
+                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
+                "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; "
+                "$xml = [Windows.Data.Xml.Dom.XmlDocument]::new(); "
+                f"$xml.LoadXml('<toast><visual><binding template=\"ToastGeneric\"><text>{escaped_title}</text><text>{escaped_msg}</text></binding></visual></toast>'); "
+                "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
+                "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Windows Audio Auto-Mute Guardian').Show($toast);"
+            )
+            startupinfo = None
+            if hasattr(subprocess, "STARTUPINFO"):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0  # SW_HIDE
+            subprocess.run(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_command],
+                capture_output=True,
+                timeout=5.0,
+                startupinfo=startupinfo,
+            )
+        except Exception as e:
+            if logger:
+                logger.debug("Desktop notification note: %s", e)
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 def get_friendly_name(enumerator, device_id: str) -> str:
     """Safely retrieves the human-readable friendly name of an audio endpoint."""
@@ -233,11 +284,13 @@ def mute_endpoint(
     device_id: str,
     device_name: str,
     saved_states: Dict[str, dict],
-    logger: logging.Logger
+    logger: logging.Logger,
+    safe_volume_cap: Optional[int] = None,
 ) -> bool:
     """
     Safely mutes a playback endpoint.
     Remembers previous volume and mute status.
+    Optionally caps the master volume slider to safe_volume_cap if specified.
     Guarantees that an already-muted device is never marked as script-muted.
     """
     if not device_id:
@@ -272,6 +325,7 @@ def mute_endpoint(
                 "previous_mute": True,
                 "previous_vol": current_vol,
                 "script_muted": False,  # Script was NOT the one that muted it
+                "volume_reduced": False,
             }
             return True
 
@@ -281,6 +335,7 @@ def mute_endpoint(
             "previous_mute": False,
             "previous_vol": current_vol,
             "script_muted": True,   # Script initiated the mute
+            "volume_reduced": False,
         }
 
         # Perform mute
@@ -291,6 +346,23 @@ def mute_endpoint(
             device_name,
             vol_pct
         )
+
+        # Optional Safe Volume Cap
+        if safe_volume_cap is not None:
+            safe_scalar = max(0.0, min(1.0, float(safe_volume_cap) / 100.0))
+            if current_vol > safe_scalar:
+                try:
+                    vol.SetMasterVolumeLevelScalar(safe_scalar, None)
+                    saved_states[device_id]["volume_reduced"] = True
+                    logger.info(
+                        "Capped volume slider of '%s' from %d%% to safe level %d%%.",
+                        device_name,
+                        vol_pct,
+                        int(round(safe_scalar * 100))
+                    )
+                except Exception as vol_err:
+                    logger.debug("Could not cap volume scalar: %s", vol_err)
+
         return True
     except (comtypes.COMError, OSError) as e:
         logger.error("Failed to mute device '%s': %s", device_name, e)
@@ -331,6 +403,20 @@ def restore_endpoint(
 
         vol.SetMute(0, None)
         state_info["script_muted"] = False
+
+        # Restore previous volume if it was capped
+        if state_info.get("volume_reduced") and "previous_vol" in state_info:
+            try:
+                vol.SetMasterVolumeLevelScalar(state_info["previous_vol"], None)
+                state_info["volume_reduced"] = False
+                logger.info(
+                    "Restored volume level to %d%% for device '%s'.",
+                    int(round(state_info["previous_vol"] * 100)),
+                    device_name
+                )
+            except Exception as vol_err:
+                logger.debug("Could not restore volume scalar: %s", vol_err)
+
         logger.info("Restored previous unmuted state for device '%s'.", device_name)
         return True
     except (comtypes.COMError, OSError) as e:
@@ -652,6 +738,8 @@ class AudioAutoMuteMonitor(MMNotificationClient):
         mute_all_non_earphone: bool = False,
         restore_on_reconnect: bool = False,
         pause_media: bool = False,
+        notify_on_disconnect: bool = NOTIFY_ON_DISCONNECT,
+        safe_volume_cap: Optional[int] = SAFE_VOLUME_CAP,
         battery_monitoring_enabled: bool = BATTERY_MONITORING_ENABLED,
         battery_check_interval: float = BATTERY_CHECK_INTERVAL,
         low_battery_warning_enabled: bool = LOW_BATTERY_WARNING_ENABLED,
@@ -665,6 +753,8 @@ class AudioAutoMuteMonitor(MMNotificationClient):
         self.mute_all_non_earphone = mute_all_non_earphone
         self.restore_on_reconnect = restore_on_reconnect
         self.pause_media = pause_media
+        self.notify_on_disconnect = notify_on_disconnect
+        self.safe_volume_cap = safe_volume_cap
         self.battery_monitoring_enabled = battery_monitoring_enabled
         self.battery_check_interval = battery_check_interval
         self.low_battery_warning_enabled = low_battery_warning_enabled
@@ -959,6 +1049,8 @@ class AudioAutoMuteMonitor(MMNotificationClient):
             "-" * 50,
             f"Status:           {'Armed' if self.was_earphone_active_or_default else 'Standby'}",
             f"Mute-on-disconnect: {'Enabled' if self.mute_new_default_only else 'Disabled'}",
+            f"Desktop Notification: {'Enabled' if self.notify_on_disconnect else 'Disabled'}",
+            f"Safe Volume Cap:   {f'{self.safe_volume_cap}%' if self.safe_volume_cap is not None else 'Disabled'}",
             "",
             "Battery Monitor",
             "-" * 50,
@@ -1098,7 +1190,8 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                         cur_def_id,
                         cur_def_name,
                         self.saved_device_states,
-                        self.logger
+                        self.logger,
+                        safe_volume_cap=self.safe_volume_cap
                     )
 
                 # Optional broad mode: mute all non-earphone render endpoints
@@ -1115,10 +1208,19 @@ class AudioAutoMuteMonitor(MMNotificationClient):
                                     dev_id,
                                     dev.FriendlyName,
                                     self.saved_device_states,
-                                    self.logger
+                                    self.logger,
+                                    safe_volume_cap=self.safe_volume_cap
                                 )
                     except Exception as e:
                         self.logger.error("Error executing broad mute: %s", e)
+
+                # Optional Desktop Toast Notification
+                if self.notify_on_disconnect:
+                    show_desktop_notification(
+                        "Windows Audio Auto-Mute",
+                        f"Wireless earphones disconnected! Muted '{cur_def_name}' to protect privacy.",
+                        self.logger
+                    )
 
                 # Optional Media Pause
                 if self.pause_media:
@@ -1258,6 +1360,27 @@ def main():
         help="Send a Windows Media Play/Pause key event on disconnect to pause background playback."
     )
     parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Enable native Windows desktop notifications when earphones disconnect."
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="Disable native Windows desktop notifications on disconnect."
+    )
+    parser.add_argument(
+        "--safe-volume",
+        type=int,
+        default=None,
+        help="Cap speaker volume slider to this percentage (0-100) when muting to prevent loud bursts if accidentally unmuted."
+    )
+    parser.add_argument(
+        "--mute-all",
+        action="store_true",
+        help="Enable broad protection mode: mute ALL active playback endpoints on disconnect."
+    )
+    parser.add_argument(
         "--battery",
         action="store_true",
         help="Query and display connected wireless earphone battery percentage, then exit."
@@ -1273,6 +1396,24 @@ def main():
         default=None,
         help="Override BATTERY_CHECK_INTERVAL in seconds (default: 30.0)."
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Set logging verbosity level (default: INFO)."
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Shortcut for --log-level DEBUG."
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Optional path to write log output."
+    )
     args = parser.parse_args()
 
     if args.list_devices:
@@ -1287,8 +1428,13 @@ def main():
     effective_id = args.device_id if args.device_id is not None else EARPHONE_DEVICE_ID
     effective_restore = True if args.restore else RESTORE_ON_EARPHONE_RECONNECT
     effective_pause = True if args.pause_media else PAUSE_MEDIA_ON_DISCONNECT
+    effective_notify = False if args.no_notify else (True if args.notify else NOTIFY_ON_DISCONNECT)
+    effective_safe_vol = args.safe_volume if args.safe_volume is not None else SAFE_VOLUME_CAP
+    effective_mute_all = True if args.mute_all else MUTE_ALL_NON_EARPHONE_OUTPUTS
     effective_battery_enabled = False if args.no_battery else BATTERY_MONITORING_ENABLED
     effective_battery_interval = args.battery_interval if args.battery_interval is not None else BATTERY_CHECK_INTERVAL
+    effective_log_level = "DEBUG" if args.debug else (args.log_level if args.log_level else LOG_LEVEL)
+    effective_log_file = args.log_file if args.log_file is not None else LOG_FILE
 
     if args.battery:
         logger = setup_logger("ERROR", None)
@@ -1296,15 +1442,17 @@ def main():
         print_battery_summary(info, str(effective_name) if effective_name else None)
         return 0
 
-    logger = setup_logger(LOG_LEVEL, LOG_FILE)
+    logger = setup_logger(effective_log_level, effective_log_file)
 
     monitor = AudioAutoMuteMonitor(
         earphone_name=effective_name,
         earphone_id=effective_id,
         mute_new_default_only=MUTE_NEW_DEFAULT_ONLY,
-        mute_all_non_earphone=MUTE_ALL_NON_EARPHONE_OUTPUTS,
+        mute_all_non_earphone=effective_mute_all,
         restore_on_reconnect=effective_restore,
         pause_media=effective_pause,
+        notify_on_disconnect=effective_notify,
+        safe_volume_cap=effective_safe_vol,
         battery_monitoring_enabled=effective_battery_enabled,
         battery_check_interval=effective_battery_interval,
         low_battery_warning_enabled=LOW_BATTERY_WARNING_ENABLED,
