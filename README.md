@@ -1,4 +1,4 @@
-# Windows Audio Auto-Mute Guardian (Python)
+﻿# Windows Audio Auto-Mute Guardian (Python)
 
 [![Windows Audio Tests](https://github.com/farmanullah1/audio-auto-mute-Python/actions/workflows/test.yml/badge.svg)](https://github.com/farmanullah1/audio-auto-mute-Python/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -119,36 +119,30 @@ Left Earbud:     Not available
 Right Earbud:    Not available
 Charging Case:   Not available
 Overall Battery: 100%
-
-Charging:
-Left:            N/A
-Right:           N/A
-Case:            N/A
-Overall:         N/A
 ==================================================
 ```
 
-### 2. Test Audio Mute Control (Safe 2-Second Test)
-Verify that Windows Audio communication works properly on your system:
+### 2. Run Self-Test
+Verify that the tool can successfully mute your default speaker:
 ```powershell
 python audio_auto_mute.py --test-mute
 ```
-*Expected: Your default output mutes for 2 seconds, confirms the mute icon on your taskbar, and restores the original volume state.*
 
-### 3. View All Connected Audio Devices
-Inspect all playback endpoints, friendly names, and exact Windows IDs:
+### 3. List Audio Devices
+Inspect all connected audio rendering devices, states, and Core Audio GUIDs:
 ```powershell
 python audio_auto_mute.py --list-devices
 ```
 
-### 4. Start Protection & Battery Monitor
-You can start protection in any of these ways:
-* **1-Click Desktop Icon**: Double-click the **Audio Guardian** shortcut on your Windows Desktop.
-* **Batch Launcher**: Double-click [`run.bat`](run.bat).
-* **Terminal**: Run in PowerShell or Command Prompt:
-  ```powershell
-  python audio_auto_mute.py
-  ```
+### 4. Start Real-Time Guardian
+Start monitoring using the batch script or Python directly:
+```powershell
+.\run.bat
+```
+or
+```powershell
+python audio_auto_mute.py
+```
 
 Dashboard display:
 ```text
@@ -326,4 +320,3 @@ You can verify at any time that this tool makes **zero** background modification
 ## 📄 License
 
 MIT License. Free for personal and commercial use.
-
