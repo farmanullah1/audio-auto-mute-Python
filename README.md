@@ -59,8 +59,10 @@ This tool operates under a strict **Zero-Persistence Policy**:
 * **0.0% Idle CPU**: Thread sleeps in a kernel wait state (`threading.Event.wait()`) until Windows fires an audio event.
 * **Scenario Discrimination**: Distinguishes between accidental disconnection (Scenario A) and manual device switching (Scenario B).
 * **Pre-Existing Mute Safety**: Queries `GetMute()` before taking action. If your laptop speaker was already muted, it is left untouched and will **never** be inadvertently unmuted.
-* **Multi-Earphone Support**: Configure single or multiple headset names (e.g. `["RONiN ECLIPSE", "Sony WH-1000XM4", "AirPods"]`).
-* **Optional Media Auto-Pause**: Can automatically trigger `VK_MEDIA_PLAY_PAUSE` to pause YouTube, Spotify, or media players upon disconnect.
+* **Accidental Unmute Protection (Safe Volume Cap)**: Optional `--safe-volume <PCT>` caps speaker volume level to prevent sudden sound blasts if accidentally unmuted.
+* **Native Windows Toast Notifications**: Built-in, non-blocking asynchronous notifications ("*Earphones disconnected: Speakers muted*") with 0 external dependencies.
+* **Multi-Earphone Support**: Configure single or multiple headset names (e.g. `["RONiN ECLIPSE", "Sony WH-1000XM4", "AirPods"]`) with active device priority.
+* **Optional Media Auto-Pause**: Can automatically trigger `VK_MEDIA_PLAY_PAUSE` (with extended key flags) to pause YouTube, Spotify, or media players upon disconnect.
 * **Modern Standby & Sleep Resilience**: Self-heals and re-acquires the Windows Audio COM enumerator after laptop lid-close / sleep cycles.
 * **Instant Self-Test Flag (`--test-mute`)**: Verify volume and mute control on your laptop speaker in 2 seconds without having to disconnect hardware.
 * **🔋 Live Wireless Earphone Battery Monitoring**:
@@ -198,6 +200,10 @@ You can override settings on the fly from the command line without editing code:
 
 | Argument | Description | Example |
 | :--- | :--- | :--- |
+| `--notify` | Enable native Windows desktop notifications on disconnect (default: Enabled). | `python audio_auto_mute.py --notify` |
+| `--no-notify` | Disable native Windows desktop notifications on disconnect. | `python audio_auto_mute.py --no-notify` |
+| `--safe-volume <PCT>` | Cap speaker volume slider (0-100%) when muting to prevent loud sound if unmuted. | `python audio_auto_mute.py --safe-volume 15` |
+| `--mute-all` | Broad protection mode: mute ALL active output endpoints on disconnect. | `python audio_auto_mute.py --mute-all` |
 | `--battery` | Query connected earphone battery percentage, then exit. | `python audio_auto_mute.py --battery` |
 | `--no-battery` | Disable background earphone battery monitoring. | `python audio_auto_mute.py --no-battery` |
 | `--battery-interval <SEC>` | Set battery polling interval in seconds (default: 30.0). | `python audio_auto_mute.py --battery-interval 45` |
@@ -207,6 +213,9 @@ You can override settings on the fly from the command line without editing code:
 | `--device-id <ID>` | Target specific Core Audio Endpoint GUID. | `python audio_auto_mute.py --device-id "{0.0.0...}"` |
 | `--restore` | Automatically unmute speakers when earphones reconnect. | `python audio_auto_mute.py --restore` |
 | `--pause-media` | Send a media Play/Pause keystroke on disconnect. | `python audio_auto_mute.py --pause-media` |
+| `--debug` | Run with verbose debug logging enabled. | `python audio_auto_mute.py --debug` |
+| `--log-level <LEVEL>` | Set log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). | `python audio_auto_mute.py --log-level DEBUG` |
+| `--log-file <PATH>` | Write logs to a rotating file. | `python audio_auto_mute.py --log-file guardian.log` |
 
 ---
 
@@ -239,6 +248,12 @@ RESTORE_ON_EARPHONE_RECONNECT = False
 
 # Send Windows Media Key (VK_MEDIA_PLAY_PAUSE) event on disconnect (Default: False)
 PAUSE_MEDIA_ON_DISCONNECT = False
+
+# Display Windows desktop toast notification on disconnect (Default: True)
+NOTIFY_ON_DISCONNECT = True
+
+# Cap speaker volume slider to safe percentage upon disconnect (e.g. 15, or None to keep existing volume)
+SAFE_VOLUME_CAP = None
 
 # Heartbeat interval in seconds (Default: 1.0)
 POLL_INTERVAL = 1.0
@@ -273,14 +288,19 @@ You can verify all scenarios using the included unit test suite:
 python -m unittest test_audio_auto_mute.py -v
 ```
 
-All 19 test cases cover:
+All 28 test cases cover:
 * Muting unmuted endpoints
 * Preserving already-muted endpoints
+* Safe volume capping on mute
+* Volume restoration on reconnect
+* Desktop notification worker execution
+* COM callbacks (`on_default_device_changed`, `on_device_state_changed`, `on_device_removed`)
 * Restoration safety rules
 * Scenario A (Disconnect transition)
 * Scenario B (Manual switch rejection)
-* Multi-device matching
-* Media key event dispatch
+* Multi-device matching and active-device priority
+* Media key event dispatch with extended key flag
+* Sleep recovery enumerator re-acquisition on RPC disconnect
 * Battery live percentage formatting
 * Battery disconnected "Last known" labeling
 * Strict no-guessing validation
